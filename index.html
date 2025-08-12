@@ -89,11 +89,12 @@
 
 <script>
 let pc = null, ws = null, stream = null, keepAlive = null;
+let queue = []; // cola de mensajes hasta que el WS esté OPEN
 
 const $ = (id) => document.getElementById(id);
-const log = (m) => { console.log(m); const el = $("log"); el.textContent += m + "\n"; el.scrollTop = el.scrollHeight; $("status").value = m; };
+const log = (m) => { console.log(m); const el = $("log"); el.textContent += m + "
+"; el.scrollTop = el.scrollHeight; $("status").value = m; };
 
-// Defaults desde querystring o placeholders
 (function initDefaults(){
   const qs = new URLSearchParams(location.search);
   $("wss").value   = qs.get("ws")     || "wss://camweb-signaling.onrender.com";
@@ -102,6 +103,49 @@ const log = (m) => { console.log(m); const el = $("log"); el.textContent += m + 
   $("facing").value= qs.get("facing") || "environment";
   $("res").value   = qs.get("res")    || "1280x720";
 })();
+
+function wsSend(obj){
+  const data = JSON.stringify(obj);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(data);
+  } else {
+    queue.push(data);
+  }
+}
+
+function flushQueue(){
+  try { for (const d of queue) ws.send(d); } catch(e) { console.warn(e); }
+  queue = [];
+}
+
+function openWs(url, from, to){
+  return new Promise((resolve,reject)=>{
+    try{
+      ws = new WebSocket(url);
+      ws.onopen = () => {
+        log("WS conectado");
+        flushQueue();
+        wsSend({type:"hello", role:"sender", from, to});
+        if (keepAlive) clearInterval(keepAlive);
+        keepAlive = setInterval(()=>{
+          if (ws.readyState === WebSocket.OPEN) wsSend({type:"ping", from, to});
+        }, 25000);
+        resolve();
+      };
+      ws.onmessage = async (ev) => {
+        const m = JSON.parse(ev.data||"{}");
+        if (m.type === "answer" && m.sdp && pc) {
+          await pc.setRemoteDescription({type:"answer", sdp:m.sdp});
+          log("Answer aplicada");
+        } else if (m.type === "ice" && m.candidate && pc) {
+          try { await pc.addIceCandidate(m.candidate); } catch(e){ log("addIceCandidate err "+e); }
+        }
+      };
+      ws.onclose = () => { log("WS cerrado"); if (keepAlive) clearInterval(keepAlive); };
+      ws.onerror = (e) => { console.error(e); log("WS error"); };
+    }catch(e){ reject(e); }
+  });
+}
 
 async function acquireStream() {
   const facing = $("facing").value;
@@ -120,44 +164,20 @@ async function connect() {
   if (!wss || !from || !to) { log("Faltan datos (WSS/from/to)"); return; }
 
   await acquireStream();
+  await openWs(wss, from, to); // <— esperamos a que el WS esté OPEN
 
-  // WebSocket
-  ws = new WebSocket(wss);
-  ws.onopen = () => {
-    log("WS conectado");
-    ws.send(JSON.stringify({type:"hello", role:"sender", from, to}));
-    if (keepAlive) clearInterval(keepAlive);
-    keepAlive = setInterval(()=>{
-      try { ws.send(JSON.stringify({type:"ping", from, to})); } catch (e) {}
-    }, 25000);
-  };
-  ws.onmessage = async (ev) => {
-    const m = JSON.parse(ev.data||"{}");
-    if (m.type === "answer" && m.sdp && pc) {
-      await pc.setRemoteDescription({type:"answer", sdp:m.sdp});
-      log("Answer aplicada");
-    } else if (m.type === "ice" && m.candidate && pc) {
-      try { await pc.addIceCandidate(m.candidate); } catch(e){ log("addIceCandidate err "+e); }
-    }
-  };
-  ws.onclose = () => { log("WS cerrado"); if (keepAlive) clearInterval(keepAlive); };
-  ws.onerror = (e) => { console.error(e); log("WS error"); };
-
-  // PeerConnection
   pc = new RTCPeerConnection({
     iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
     sdpSemantics: "unified-plan"
   });
   pc.onicecandidate = (ev) => {
-    if (ev.candidate) ws?.send(JSON.stringify({type:"ice", from, to, candidate:ev.candidate}));
+    if (ev.candidate) wsSend({type:"ice", from, to, candidate:ev.candidate});
   };
-  // Añadir cámara
   stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
-  // Crear y enviar Offer
   const offer = await pc.createOffer({offerToReceiveVideo:false, offerToReceiveAudio:false});
   await pc.setLocalDescription(offer);
-  ws?.send(JSON.stringify({type:"offer", from, to, sdp: offer.sdp}));
+  wsSend({type:"offer", from, to, sdp: offer.sdp}); // <— ahora SIEMPRE se envía con WS OPEN
   log("Offer enviada");
 }
 
