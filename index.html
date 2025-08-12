@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CAMWeb Sender</title>
+  <style>
+    :root { --bg:#0b0f14; --fg:#e6eef7; --muted:#97a6b3; --accent:#58a6ff; }
+    *{box-sizing:border-box} body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+    header{padding:18px 16px;border-bottom:1px solid #1c2430;background:#0e141b;position:sticky;top:0}
+    h1{font-size:18px;margin:0} small{color:var(--muted)}
+    main{padding:16px;max-width:880px;margin:0 auto;display:grid;gap:14px}
+    .card{background:#0e141b;border:1px solid #1c2430;border-radius:14px;box-shadow:0 4px 20px rgba(0,0,0,.25);padding:14px}
+    label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
+    input,select,button{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #223043;background:#0b0f14;color:var(--fg);font-size:15px}
+    input:focus,select:focus,button:focus{outline:2px solid var(--accent);outline-offset:1px}
+    .row{display:grid;gap:10px;grid-template-columns:1fr 1fr}
+    .actions{display:flex;gap:10px;flex-wrap:wrap}
+    .actions button{flex:1 1 180px;background:#102033;border-color:#193555}
+    .actions button.primary{background:#143a66;border-color:#215b94}
+    video{width:100%;max-width:560px;border-radius:14px;border:1px solid #1c2430;background:#000}
+    pre{max-height:280px;overflow:auto;background:#0b0f14;border:1px solid #1c2430;border-radius:12px;padding:12px;font-size:12px;line-height:1.35}
+    a{color:var(--accent)}
+  </style>
+</head>
+<body>
+<header>
+  <h1>CAMWeb Sender <small> · envía la cámara del teléfono emisor</small></h1>
+</header>
+
+<main>
+  <section class="card">
+    <div class="row">
+      <div>
+        <label>Servidor WSS</label>
+        <input id="wss" placeholder="wss://camweb-signaling.onrender.com">
+      </div>
+      <div>
+        <label>Cámara</label>
+        <select id="facing">
+          <option value="environment">Trasera (environment)</option>
+          <option value="user">Frontal (user)</option>
+        </select>
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div>
+        <label>Mi ID (sender)</label>
+        <input id="from" placeholder="senderPhone">
+      </div>
+      <div>
+        <label>Destino (receiver)</label>
+        <input id="to" placeholder="rootPhone">
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div>
+        <label>Resolución</label>
+        <select id="res">
+          <option value="1280x720">1280×720</option>
+          <option value="1920x1080">1920×1080</option>
+          <option value="640x360">640×360</option>
+        </select>
+      </div>
+      <div>
+        <label>Estado</label>
+        <input id="status" readonly value="Idle">
+      </div>
+    </div>
+    <div class="actions" style="margin-top:12px">
+      <button class="primary" id="connect">Conectar y enviar cámara</button>
+      <button id="flip">Cambiar cámara</button>
+      <button id="stop">Detener</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <video id="local" playsinline autoplay muted></video>
+  </section>
+
+  <section class="card">
+    <label>Log</label>
+    <pre id="log"></pre>
+    <div style="font-size:12px;color:#8292a6;margin-top:8px">
+      Consejo: también puedes configurar por URL, ej.: <code>?from=senderPhone&to=rootPhone&ws=wss%3A%2F%2Fcamweb-signaling.onrender.com&facing=environment&res=1280x720</code>
+    </div>
+  </section>
+</main>
+
+<script>
+let pc = null, ws = null, stream = null, keepAlive = null;
+
+const $ = (id) => document.getElementById(id);
+const log = (m) => { console.log(m); const el = $("log"); el.textContent += m + "\n"; el.scrollTop = el.scrollHeight; $("status").value = m; };
+
+// Defaults desde querystring o placeholders
+(function initDefaults(){
+  const qs = new URLSearchParams(location.search);
+  $("wss").value   = qs.get("ws")     || "wss://camweb-signaling.onrender.com";
+  $("from").value  = qs.get("from")   || "senderPhone";
+  $("to").value    = qs.get("to")     || "rootPhone";
+  $("facing").value= qs.get("facing") || "environment";
+  $("res").value   = qs.get("res")    || "1280x720";
+})();
+
+async function acquireStream() {
+  const facing = $("facing").value;
+  const [w,h] = $("res").value.split("x").map(Number);
+  if (stream) { stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  const constraints = { video: { facingMode: { ideal: facing }, width:{ ideal:w }, height:{ ideal:h }}, audio: false };
+  stream = await navigator.mediaDevices.getUserMedia(constraints);
+  $("local").srcObject = stream;
+  log(`Cámara lista ${w}x${h} (${facing})`);
+}
+
+async function connect() {
+  const wss = $("wss").value.trim();
+  const from = $("from").value.trim();
+  const to = $("to").value.trim();
+  if (!wss || !from || !to) { log("Faltan datos (WSS/from/to)"); return; }
+
+  await acquireStream();
+
+  // WebSocket
+  ws = new WebSocket(wss);
+  ws.onopen = () => {
+    log("WS conectado");
+    ws.send(JSON.stringify({type:"hello", role:"sender", from, to}));
+    if (keepAlive) clearInterval(keepAlive);
+    keepAlive = setInterval(()=>{
+      try { ws.send(JSON.stringify({type:"ping", from, to})); } catch (e) {}
+    }, 25000);
+  };
+  ws.onmessage = async (ev) => {
+    const m = JSON.parse(ev.data||"{}");
+    if (m.type === "answer" && m.sdp && pc) {
+      await pc.setRemoteDescription({type:"answer", sdp:m.sdp});
+      log("Answer aplicada");
+    } else if (m.type === "ice" && m.candidate && pc) {
+      try { await pc.addIceCandidate(m.candidate); } catch(e){ log("addIceCandidate err "+e); }
+    }
+  };
+  ws.onclose = () => { log("WS cerrado"); if (keepAlive) clearInterval(keepAlive); };
+  ws.onerror = (e) => { console.error(e); log("WS error"); };
+
+  // PeerConnection
+  pc = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    sdpSemantics: "unified-plan"
+  });
+  pc.onicecandidate = (ev) => {
+    if (ev.candidate) ws?.send(JSON.stringify({type:"ice", from, to, candidate:ev.candidate}));
+  };
+  // Añadir cámara
+  stream.getTracks().forEach(t => pc.addTrack(t, stream));
+
+  // Crear y enviar Offer
+  const offer = await pc.createOffer({offerToReceiveVideo:false, offerToReceiveAudio:false});
+  await pc.setLocalDescription(offer);
+  ws?.send(JSON.stringify({type:"offer", from, to, sdp: offer.sdp}));
+  log("Offer enviada");
+}
+
+function stopAll(){
+  try{ if (keepAlive) clearInterval(keepAlive); keepAlive=null; }catch(e){}
+  try{ ws?.close(); ws=null; }catch(e){}
+  try{ pc?.getSenders().forEach(s=>{ try{s.track?.stop()}catch(e){} }); pc?.close(); pc=null; }catch(e){}
+  try{ if (stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; } }catch(e){}
+  log("Detenido");
+}
+
+$("connect").onclick = ()=> connect().catch(e=>{ console.error(e); log("Error: "+e); });
+$("flip").onclick    = ()=> { $("facing").value = ($("facing").value === "environment" ? "user" : "environment"); acquireStream().catch(e=>{ console.error(e); log("Cam err: "+e); }); };
+$("stop").onclick    = stopAll;
+</script>
+</body>
+</html>
